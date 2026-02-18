@@ -1,0 +1,246 @@
+{
+  "unicycle_static_obstacle": {
+    "system": "unicycle_static_obstacle",
+    "input_features": [
+      {
+        "name": "initial_distance_to_obstacle",
+        "meaning": "Distance from unicycle COM to obstacle center at t=0",
+        "units": "m",
+        "range": [
+          0.7,
+          2.6
+        ]
+      },
+      {
+        "name": "initial_speed",
+        "meaning": "Initial forward speed v(0)",
+        "units": "m/s",
+        "range": [
+          0.0,
+          2.5
+        ]
+      },
+      {
+        "name": "obstacle_radius",
+        "meaning": "Circular obstacle radius",
+        "units": "m",
+        "range": [
+          0.35,
+          1.0
+        ]
+      },
+      {
+        "name": "initial_heading_error",
+        "meaning": "Initial heading error relative to +x direction toward goal",
+        "units": "rad",
+        "range": [
+          -3.141592653589793,
+          3.141592653589793
+        ]
+      }
+    ],
+    "sampling_strategy": "uniform_random",
+    "controller_parameters": {
+      "legacy": {
+        "type": "proportional_controller",
+        "Kp_pos": 1.2,
+        "Kp_theta": 1.0,
+        "goal_state": [
+          4.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "control_limits": [
+          3.0,
+          2.5
+        ]
+      },
+      "evolved": {
+        "type": "vanilla_cbf_qp_controller",
+        "Kp_pos": 1.2,
+        "Kp_theta": 1.0,
+        "cbf_alpha_linear_class_k": 2.0,
+        "cbf_velocity_weight": 1.0,
+        "barrier": "h_cbf(x,t)=||p-p_obs(t)||^2-r^2 + k_v*v*<p-p_obs(t),[cos(theta),sin(theta)]>; safety label uses h_safe=||p-p_obs(t)||^2-r^2",
+        "control_limits": [
+          3.0,
+          2.5
+        ]
+      }
+    },
+    "simulation": {
+      "time_step_s": 0.1,
+      "total_duration_s": 15.0,
+      "num_steps": 150
+    },
+    "seeds": {
+      "sampling_seed": 20260212,
+      "legacy_base_seed": 30100,
+      "evolved_base_seed": 40100
+    },
+    "dataset_sizes": {
+      "D_legacy": 100,
+      "D_evolved": 95,
+      "D_paired_comparison": 100
+    },
+    "label_counts": {
+      "D_legacy": {
+        "Pass": 79,
+        "Fail": 21
+      },
+      "D_evolved_before_filter": {
+        "Pass": 95,
+        "Fail": 5
+      },
+      "D_evolved_after_filter": {
+        "Pass": 95,
+        "Fail": 0
+      },
+      "D_paired_legacy": {
+        "Pass": 79,
+        "Fail": 21
+      },
+      "D_paired_evolved": {
+        "Pass": 95,
+        "Fail": 5
+      }
+    },
+    "index_alignment": {
+      "case_id_column": true,
+      "paired_index_datasets_enabled": true,
+      "paired_note": "Use D_paired_comparison.csv for one-to-one test cases with both controller labels."
+    }
+  },
+  "unicycle_dynamic_obstacle": {
+    "system": "unicycle_dynamic_obstacle",
+    "input_features": [
+      {
+        "name": "initial_distance_to_obstacle",
+        "meaning": "Distance from unicycle COM to obstacle center at t=0",
+        "units": "m",
+        "range": [
+          0.9,
+          3.0
+        ]
+      },
+      {
+        "name": "initial_speed",
+        "meaning": "Initial forward speed v(0)",
+        "units": "m/s",
+        "range": [
+          0.0,
+          2.5
+        ]
+      },
+      {
+        "name": "obstacle_radius",
+        "meaning": "Circular obstacle radius",
+        "units": "m",
+        "range": [
+          0.35,
+          0.9
+        ]
+      },
+      {
+        "name": "initial_heading_error",
+        "meaning": "Initial heading error relative to +x direction toward goal",
+        "units": "rad",
+        "range": [
+          -3.141592653589793,
+          3.141592653589793
+        ]
+      },
+      {
+        "name": "obstacle_speed",
+        "meaning": "Obstacle translational speed",
+        "units": "m/s",
+        "range": [
+          0.0,
+          1.2
+        ]
+      },
+      {
+        "name": "obstacle_heading",
+        "meaning": "Obstacle heading angle in world frame",
+        "units": "rad",
+        "range": [
+          -3.141592653589793,
+          3.141592653589793
+        ]
+      }
+    ],
+    "sampling_strategy": "uniform_random",
+    "controller_parameters": {
+      "legacy": {
+        "type": "proportional_controller",
+        "Kp_pos": 1.2,
+        "Kp_theta": 1.0,
+        "goal_state": [
+          4.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "control_limits": [
+          3.0,
+          2.5
+        ]
+      },
+      "evolved": {
+        "type": "vanilla_cbf_qp_controller",
+        "Kp_pos": 1.2,
+        "Kp_theta": 1.0,
+        "cbf_alpha_linear_class_k": 2.0,
+        "cbf_velocity_weight": 1.0,
+        "barrier": "h_cbf(x,t)=||p-p_obs(t)||^2-r^2 + k_v*v*<p-p_obs(t),[cos(theta),sin(theta)]>; safety label uses h_safe=||p-p_obs(t)||^2-r^2",
+        "control_limits": [
+          3.0,
+          2.5
+        ]
+      }
+    },
+    "simulation": {
+      "time_step_s": 0.1,
+      "total_duration_s": 15.0,
+      "num_steps": 150
+    },
+    "seeds": {
+      "sampling_seed": 20261212,
+      "legacy_base_seed": 31100,
+      "evolved_base_seed": 41100
+    },
+    "dataset_sizes": {
+      "D_legacy": 100,
+      "D_evolved": 88,
+      "D_paired_comparison": 100
+    },
+    "label_counts": {
+      "D_legacy": {
+        "Pass": 75,
+        "Fail": 25
+      },
+      "D_evolved_before_filter": {
+        "Pass": 88,
+        "Fail": 12
+      },
+      "D_evolved_after_filter": {
+        "Pass": 88,
+        "Fail": 0
+      },
+      "D_paired_legacy": {
+        "Pass": 75,
+        "Fail": 25
+      },
+      "D_paired_evolved": {
+        "Pass": 88,
+        "Fail": 12
+      }
+    },
+    "index_alignment": {
+      "case_id_column": true,
+      "paired_index_datasets_enabled": true,
+      "paired_note": "Use D_paired_comparison.csv for one-to-one test cases with both controller labels."
+    }
+  }
+}
