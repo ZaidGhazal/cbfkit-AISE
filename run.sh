@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-source "${HOME}/miniconda3/etc/profile.d/conda.sh"
+if command -v conda >/dev/null 2>&1; then
+  eval "$(conda shell.bash hook)"
+elif [[ -f "${HOME}/opt/miniconda3/etc/profile.d/conda.sh" ]]; then
+  source "${HOME}/opt/miniconda3/etc/profile.d/conda.sh"
+elif [[ -f "${HOME}/miniconda3/etc/profile.d/conda.sh" ]]; then
+  source "${HOME}/miniconda3/etc/profile.d/conda.sh"
+else
+  echo "Conda initialization script not found. Install Conda or update run.sh." >&2
+  exit 1
+fi
+
 conda activate cbfkit
 
 N_BATCHES=100
