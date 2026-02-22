@@ -15,16 +15,51 @@ import argparse
 import csv
 import json
 import math
+import os
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+SAFE_RUNTIME_FLAG = "--safe-runtime"
+SAFE_RUNTIME_SENTINEL = "CBFKIT_SAFE_RUNTIME_APPLIED"
+
+
+def _maybe_enable_safe_runtime() -> None:
+    """Relaunch the script with conservative CPU/XLA settings."""
+    if SAFE_RUNTIME_FLAG not in sys.argv:
+        return
+    if os.environ.get(SAFE_RUNTIME_SENTINEL) == "1":
+        return
+
+    env = os.environ.copy()
+    env[SAFE_RUNTIME_SENTINEL] = "1"
+    env.setdefault("OMP_NUM_THREADS", "1")
+    env.setdefault("OPENBLAS_NUM_THREADS", "1")
+    env.setdefault("MKL_NUM_THREADS", "1")
+    env.setdefault("JAX_PLATFORMS", "cpu")
+    env.setdefault("JAX_PLATFORM_NAME", "cpu")
+    env.setdefault("JAX_DISABLE_JIT", "1")
+    env.setdefault(
+        "XLA_FLAGS",
+        "--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1",
+    )
+    print(
+        "[runtime] Enabling safe runtime mode "
+        "(OMP/BLAS threads=1, CPU-only backend, JAX JIT disabled)."
+    )
+    os.execvpe(sys.executable, [sys.executable, *sys.argv], env)
+
+
+_maybe_enable_safe_runtime()
 
 import jax.numpy as jnp
 import numpy as np
 from jax import Array, jacfwd, jacrev, random
 
 import cbfkit.simulation.simulator as sim
+from cbfkit.utils import logger as sim_logger
 import cbfkit.systems.unicycle.models.accel_unicycle as unicycle
 from cbfkit.controllers.model_based.cbf_clf_controllers import (
     robust_cbf_clf_qp_controller,
@@ -322,6 +357,8 @@ def run_single_simulation(
     cbf_controller_kind: str,
     disturbance_norm_bound: float,
     disturbance_norm: str,
+    progress_label: Optional[str] = None,
+    progress_step_every: int = 0,
 ) -> Dict[str, object]:
     initial_margin = initial_clearance_margin(vec)
     if initial_margin <= 0.0:
@@ -374,9 +411,15 @@ def run_single_simulation(
 
         controller = nonterminating_evolved_controller
 
+    sim_logger.clear_log()
     start_time = time.perf_counter()
-    states, _u, _z, _p, dkeys, dvalues = sim.execute(
-        x0=x0,
+    def zero_perturbation(x, _u, _f, _g):
+        def p(_subkey):
+            return jnp.zeros(x.shape)
+
+        return p
+
+    simulate_iter = sim.simulator(
         dt=dt,
         num_steps=n_steps,
         dynamics=dynamics,
@@ -384,15 +427,53 @@ def run_single_simulation(
         controller=controller,
         sensor=sensor,
         estimator=estimator,
+        perturbation=zero_perturbation,
+        sigma=None,
         key=random.PRNGKey(sim_seed),
         verbose=False,
     )
+    simulation_data = []
+    step_wall_clock_cumulative_s: List[float] = []
+    for sim_step in simulate_iter(x0):
+        simulation_data.append(sim_step)
+        elapsed_wall = time.perf_counter() - start_time
+        step_wall_clock_cumulative_s.append(elapsed_wall)
+        if progress_label and progress_step_every > 0:
+            step_idx = len(simulation_data)
+            if step_idx == 1 or step_idx % progress_step_every == 0:
+                print(
+                    f"[{system.name}] {progress_label}: "
+                    f"step {step_idx}/{n_steps}, sim_time={step_idx * dt:.2f}s, "
+                    f"wall_elapsed={elapsed_wall:.2f}s"
+                )
     case_runtime_s = time.perf_counter() - start_time
+    states, _u, _z, _p, dkeys, dvalues = sim.extract_and_log_data(None, tuple(simulation_data))
+    sim_logger.clear_log()
 
     h = safety_function(system, vec)
+    obs_center = jnp.array([0.0, 0.0])
+    obs_vel = obstacle_velocity_from_input(system, vec)
     h_values = [h(0.0, x0)]
     h_values.extend(h((i + 1) * dt, xk) for i, xk in enumerate(states))
     min_h = float(min(h_values))
+    distance_values = []
+    dx_values = []
+    dy_values = []
+    traj_states = [x0]
+    traj_states.extend(states)
+    for i, xk in enumerate(traj_states):
+        t = i * dt
+        ox = float(obs_center[0] + obs_vel[0] * t)
+        oy = float(obs_center[1] + obs_vel[1] * t)
+        dx = float(xk[0] - ox)
+        dy = float(xk[1] - oy)
+        distance = float(math.hypot(dx, dy))
+        dx_values.append(dx)
+        dy_values.append(dy)
+        distance_values.append(distance)
+    min_distance = float(min(distance_values))
+    min_dx = float(min(dx_values))
+    min_dy = float(min(dy_values))
 
     step_logs: List[Dict[str, Any]] = []
     for i, xk in enumerate(states):
@@ -404,7 +485,14 @@ def run_single_simulation(
             "state_y": float(xk[1]),
             "state_v": float(xk[2]),
             "state_theta": float(xk[3]),
-            "h": float(h(t, xk)),
+            "dx": dx_values[i + 1],
+            "dy": dy_values[i + 1],
+            "distance": distance_values[i + 1],
+            "wall_time_cumulative_s": (
+                float(step_wall_clock_cumulative_s[i])
+                if i < len(step_wall_clock_cumulative_s)
+                else float(case_runtime_s)
+            ),
         }
         controller_stats: Dict[str, Any] = {}
         if i < len(dvalues):
@@ -437,6 +525,9 @@ def run_single_simulation(
         "input_vector": vec.tolist(),
         "label": "Pass" if passed else "Fail",
         "min_h": min_h,
+        "min_distance": min_distance,
+        "min_dx": min_dx,
+        "min_dy": min_dy,
         "controller_error": error,
         "case_runtime_s": case_runtime_s,
         "step_logs": step_logs,
@@ -576,12 +667,24 @@ def generate_failure_focused_cases(
     loop_start = time.perf_counter()
 
     while len(accepted_vectors) < n_samples and attempts < max_attempts:
+        attempt_idx = attempts + 1
+        detailed_attempt_log = attempt_idx <= 3 or (attempt_idx % print_every == 0)
         vec = sample_single_input(rng, system)
         if not is_logical_initial_condition(vec):
             logical_rejections += 1
             attempts += 1
+            if detailed_attempt_log:
+                print(
+                    f"[{system.name}] attempt {attempt_idx}/{max_attempts}: "
+                    "rejected logical initial condition"
+                )
             continue
 
+        if detailed_attempt_log:
+            print(
+                f"[{system.name}] attempt {attempt_idx}/{max_attempts}: "
+                "running legacy controller simulation"
+            )
         legacy_result = run_single_simulation(
             system=system,
             vec=vec,
@@ -596,7 +699,19 @@ def generate_failure_focused_cases(
             cbf_controller_kind=cbf_controller_kind,
             disturbance_norm_bound=disturbance_norm_bound,
             disturbance_norm=disturbance_norm,
+            progress_label=f"attempt {attempt_idx} legacy" if attempt_idx == 1 else None,
+            progress_step_every=25 if attempt_idx == 1 else 0,
         )
+        if detailed_attempt_log:
+            print(
+                f"[{system.name}] attempt {attempt_idx}/{max_attempts}: "
+                f"legacy done label={legacy_result['label']}, "
+                f"runtime={float(legacy_result['case_runtime_s']):.2f}s"
+            )
+            print(
+                f"[{system.name}] attempt {attempt_idx}/{max_attempts}: "
+                "running evolved controller simulation"
+            )
         evolved_result = run_single_simulation(
             system=system,
             vec=vec,
@@ -611,7 +726,15 @@ def generate_failure_focused_cases(
             cbf_controller_kind=cbf_controller_kind,
             disturbance_norm_bound=disturbance_norm_bound,
             disturbance_norm=disturbance_norm,
+            progress_label=f"attempt {attempt_idx} evolved" if attempt_idx == 1 else None,
+            progress_step_every=25 if attempt_idx == 1 else 0,
         )
+        if detailed_attempt_log:
+            print(
+                f"[{system.name}] attempt {attempt_idx}/{max_attempts}: "
+                f"evolved done label={evolved_result['label']}, "
+                f"runtime={float(evolved_result['case_runtime_s']):.2f}s"
+            )
 
         matches_failure_target = is_failure_target_satisfied(
             failure_target, legacy_result, evolved_result
@@ -628,6 +751,11 @@ def generate_failure_focused_cases(
         if not accept_case:
             if not matches_failure_target and accepted_failure_target < required_failure_target:
                 non_failure_rejections += 1
+            if detailed_attempt_log:
+                print(
+                    f"[{system.name}] attempt {attempt_idx}/{max_attempts}: "
+                    f"rejected after simulation (matches_failure_target={matches_failure_target})"
+                )
             attempts += 1
             continue
 
@@ -643,6 +771,14 @@ def generate_failure_focused_cases(
         accepted_legacy[-1].pop("step_logs", None)
         accepted_evolved[-1].pop("step_logs", None)
         attempts += 1
+        if detailed_attempt_log:
+            print(
+                f"[{system.name}] attempt {attempt_idx}/{max_attempts}: "
+                f"accepted as case_id={case_id} "
+                f"(accepted={len(accepted_vectors)}/{n_samples}, "
+                f"failure_target={accepted_failure_target}/{required_failure_target}, "
+                f"random={accepted_random_bucket}/{required_random})"
+            )
 
         if len(accepted_vectors) % TIME_LOG_EVERY_CASES == 0:
             elapsed = time.perf_counter() - loop_start
@@ -696,7 +832,18 @@ def write_dataset_csv(
 
     with out_csv.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["case_id", *names, "label", "min_h", "controller_error", "case_runtime_s"])
+        writer.writerow(
+            [
+                "case_id",
+                *names,
+                "label",
+                "min_distance",
+                "min_dx",
+                "min_dy",
+                "controller_error",
+                "case_runtime_s",
+            ]
+        )
         for row in rows:
             vec = row["input_vector"]
             writer.writerow(
@@ -704,7 +851,9 @@ def write_dataset_csv(
                     row["case_id"],
                     *vec,
                     row["label"],
-                    row["min_h"],
+                    row["min_distance"],
+                    row["min_dx"],
+                    row["min_dy"],
                     row["controller_error"],
                     row["case_runtime_s"],
                 ]
@@ -721,14 +870,16 @@ def write_step_logs_csv(
         "case_id",
         "label",
         "controller_error",
-        "case_runtime_s",
         "step",
         "time_s",
+        "wall_time_cumulative_s",
         "state_x",
         "state_y",
         "state_v",
         "state_theta",
-        "h",
+        "dx",
+        "dy",
+        "distance",
         "controller_stats_json",
     ]
 
@@ -745,7 +896,6 @@ def write_step_logs_csv(
                         "case_id": case_id,
                         "label": label,
                         "controller_error": controller_error,
-                        "case_runtime_s": row["case_runtime_s"],
                         **step,
                     }
                 )
@@ -760,14 +910,16 @@ def append_step_logs_csv(
         "case_id",
         "label",
         "controller_error",
-        "case_runtime_s",
         "step",
         "time_s",
+        "wall_time_cumulative_s",
         "state_x",
         "state_y",
         "state_v",
         "state_theta",
-        "h",
+        "dx",
+        "dy",
+        "distance",
         "controller_stats_json",
     ]
     write_header = not out_csv.exists()
@@ -781,7 +933,6 @@ def append_step_logs_csv(
                     "case_id": case_row["case_id"],
                     "label": case_row["label"],
                     "controller_error": case_row["controller_error"],
-                    "case_runtime_s": case_row["case_runtime_s"],
                     **step,
                 }
             )
@@ -806,11 +957,15 @@ def write_paired_comparison_csv(
                 "case_id",
                 *names,
                 "legacy_label",
-                "legacy_min_h",
+                "legacy_min_distance",
+                "legacy_min_dx",
+                "legacy_min_dy",
                 "legacy_controller_error",
                 "legacy_case_runtime_s",
                 "evolved_label",
-                "evolved_min_h",
+                "evolved_min_distance",
+                "evolved_min_dx",
+                "evolved_min_dy",
                 "evolved_controller_error",
                 "evolved_case_runtime_s",
             ]
@@ -824,11 +979,15 @@ def write_paired_comparison_csv(
                     leg["case_id"],
                     *leg["input_vector"],
                     leg["label"],
-                    leg["min_h"],
+                    leg["min_distance"],
+                    leg["min_dx"],
+                    leg["min_dy"],
                     leg["controller_error"],
                     leg["case_runtime_s"],
                     evo["label"],
-                    evo["min_h"],
+                    evo["min_distance"],
+                    evo["min_dx"],
+                    evo["min_dy"],
                     evo["controller_error"],
                     evo["case_runtime_s"],
                 ]
@@ -877,6 +1036,8 @@ def generate_for_system(
         "non_failure_rejections": 0,
     }
     sys_dir = out_root / system.name
+    sys_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path = sys_dir / "metadata.json"
     legacy_step_log_path = sys_dir / "D_legacy_step_logs.csv"
     evolved_step_log_path = sys_dir / "D_evolved_step_logs.csv"
     if legacy_step_log_path.exists():
@@ -897,19 +1058,134 @@ def generate_for_system(
 
         checkpoint_counter += 1
         d_evolved_partial = [row for row in evolved_all_rows if row["label"] == "Pass"]
-        write_dataset_csv(sys_dir / "D_legacy.csv", system, legacy_rows)
-        write_dataset_csv(sys_dir / "D_evolved.csv", system, d_evolved_partial)
+        legacy_csv_path = sys_dir / "D_legacy.csv"
+        evolved_csv_path = sys_dir / "D_evolved.csv"
+        paired_csv_path = sys_dir / "D_paired_comparison.csv"
+        write_dataset_csv(legacy_csv_path, system, legacy_rows)
+        write_dataset_csv(evolved_csv_path, system, d_evolved_partial)
         if paired_index_datasets and len(legacy_rows) == len(evolved_all_rows):
             write_paired_comparison_csv(
-                sys_dir / "D_paired_comparison.csv",
+                paired_csv_path,
                 system,
                 legacy_rows,
                 evolved_all_rows,
             )
+            paired_status = f"wrote paired={paired_csv_path}"
+        else:
+            paired_status = (
+                "skipped paired "
+                f"(paired_index_datasets={paired_index_datasets}, "
+                f"legacy_rows={len(legacy_rows)}, evolved_all_rows={len(evolved_all_rows)})"
+            )
+            print(
+                f"[{system.name}] checkpoint {checkpoint_counter}: "
+                f"WARNING: skipped paired comparison (row counts: legacy={len(legacy_rows)}, evolved_all={len(evolved_all_rows)}), paired_index_datasets={paired_index_datasets}"
+            )
         print(
             f"[{system.name}] checkpoint {checkpoint_counter}: "
-            f"saved {len(legacy_rows)} legacy, {len(evolved_all_rows)} evolved-all cases"
+            f"saved {len(legacy_rows)} legacy, {len(evolved_all_rows)} evolved-all cases; "
+            f"legacy_csv={legacy_csv_path}, evolved_csv={evolved_csv_path} "
+            f"(evolved_pass_rows={len(d_evolved_partial)}), {paired_status}"
         )
+
+    def write_metadata_snapshot(
+        *,
+        generation_status: str,
+        d_legacy_rows: Optional[Sequence[Dict[str, object]]] = None,
+        d_evolved_all_rows: Optional[Sequence[Dict[str, object]]] = None,
+        d_evolved_rows: Optional[Sequence[Dict[str, object]]] = None,
+    ) -> Dict[str, object]:
+        legacy_rows = list(d_legacy_rows) if d_legacy_rows is not None else []
+        evolved_all_rows = list(d_evolved_all_rows) if d_evolved_all_rows is not None else []
+        evolved_rows = list(d_evolved_rows) if d_evolved_rows is not None else []
+
+        metadata_obj = {
+            "system": system.name,
+            "generation_status": generation_status,
+            "input_features": [
+                {
+                    "name": f.name,
+                    "meaning": f.meaning,
+                    "units": f.units,
+                    "range": [f.bounds[0], f.bounds[1]],
+                }
+                for f in system.features
+            ],
+            "sampling_strategy": system.sampling_strategy,
+            "generation_mode": {
+                "failure_focused": failure_focused,
+                "failure_target": failure_target if failure_focused else "none",
+                "random_sample_percentage": random_sample_percentage if failure_focused else 100.0,
+                "required_initial_clearance_m": INITIAL_OBSTACLE_CLEARANCE_M,
+                "focus_attempt_stats": focus_stats,
+            },
+            "controller_parameters": {
+                "legacy": {
+                    "type": "proportional_controller",
+                    "Kp_pos": kp_pos,
+                    "Kp_theta": kp_theta,
+                    "goal_state": [4.0, 0.0, 0.0, 0.0],
+                    "control_limits": control_limits.tolist(),
+                },
+                "evolved": {
+                    "type": (
+                        "robust_cbf_qp_controller"
+                        if cbf_controller_kind == "robust"
+                        else "vanilla_cbf_qp_controller"
+                    ),
+                    "cbf_controller_kind": cbf_controller_kind,
+                    "Kp_pos": kp_pos,
+                    "Kp_theta": kp_theta,
+                    "cbf_alpha_linear_class_k": cbf_alpha,
+                    "cbf_velocity_weight": CBF_VELOCITY_WEIGHT,
+                    "disturbance_norm_bound": disturbance_norm_bound,
+                    "disturbance_norm": disturbance_norm,
+                    "barrier": (
+                        "h_cbf(x,t)=||p-p_obs(t)||^2-r^2 + k_v*v*<p-p_obs(t),[cos(theta),sin(theta)]>; "
+                        "safety label uses h_safe=||p-p_obs(t)||^2-r^2"
+                    ),
+                    "control_limits": control_limits.tolist(),
+                },
+            },
+            "simulation": {
+                "time_step_s": dt,
+                "total_duration_s": total_time,
+                "num_steps": int(total_time / dt),
+            },
+            "seeds": {
+                "sampling_seed": sampling_seed,
+                "legacy_base_seed": legacy_seed,
+                "evolved_base_seed": evolved_seed,
+            },
+            "dataset_sizes": {
+                "D_legacy": len(legacy_rows),
+                "D_evolved": len(evolved_rows),
+                "D_paired_comparison": len(evolved_all_rows) if paired_index_datasets else 0,
+            },
+            "label_counts": {
+                "D_legacy": summarize_labels(legacy_rows),
+                "D_evolved_before_filter": summarize_labels(evolved_all_rows),
+                "D_evolved_after_filter": summarize_labels(evolved_rows),
+                "D_paired_legacy": summarize_labels(legacy_rows) if paired_index_datasets else {},
+                "D_paired_evolved": summarize_labels(evolved_all_rows) if paired_index_datasets else {},
+            },
+            "index_alignment": {
+                "case_id_column": True,
+                "paired_index_datasets_enabled": paired_index_datasets,
+                "paired_note": (
+                    "Use D_paired_comparison.csv for one-to-one test cases with both controller labels."
+                    if paired_index_datasets
+                    else "Enable --paired-index-datasets to export one-to-one comparison rows."
+                ),
+            },
+        }
+
+        with metadata_path.open("w", encoding="utf-8") as f:
+            json.dump(metadata_obj, f, indent=2)
+        return metadata_obj
+
+    write_metadata_snapshot(generation_status="in_progress")
+    print(f"[{system.name}] wrote initial metadata: {metadata_path}")
 
     if failure_focused:
         inputs, d_legacy, d_evolved_all, focus_stats = generate_failure_focused_cases(
@@ -934,7 +1210,7 @@ def generate_for_system(
             on_case_accepted=lambda leg_case, evo_case, leg_rows, evo_rows: (
                 append_step_logs_csv(legacy_step_log_path, leg_case),
                 append_step_logs_csv(evolved_step_log_path, evo_case),
-                checkpoint_write(leg_rows, evo_rows),
+                checkpoint_write(leg_rows, evo_rows, force=True),
             ),
         )
     else:
@@ -958,7 +1234,7 @@ def generate_for_system(
             disturbance_norm=disturbance_norm,
             on_case_complete=lambda _idx, result, rows: (
                 append_step_logs_csv(legacy_step_log_path, result),
-                checkpoint_write(rows, []),
+                checkpoint_write(rows, [], force=True),
             ),
         )
 
@@ -979,7 +1255,7 @@ def generate_for_system(
             disturbance_norm=disturbance_norm,
             on_case_complete=lambda _idx, result, rows: (
                 append_step_logs_csv(evolved_step_log_path, result),
-                checkpoint_write(d_legacy, rows),
+                checkpoint_write(d_legacy, rows, force=True),
             ),
         )
     d_evolved = [row for row in d_evolved_all if row["label"] == "Pass"]
@@ -998,88 +1274,12 @@ def generate_for_system(
             d_evolved_all,
         )
 
-    metadata = {
-        "system": system.name,
-        "input_features": [
-            {
-                "name": f.name,
-                "meaning": f.meaning,
-                "units": f.units,
-                "range": [f.bounds[0], f.bounds[1]],
-            }
-            for f in system.features
-        ],
-        "sampling_strategy": system.sampling_strategy,
-        "generation_mode": {
-            "failure_focused": failure_focused,
-            "failure_target": failure_target if failure_focused else "none",
-            "random_sample_percentage": random_sample_percentage if failure_focused else 100.0,
-            "required_initial_clearance_m": INITIAL_OBSTACLE_CLEARANCE_M,
-            "focus_attempt_stats": focus_stats,
-        },
-        "controller_parameters": {
-            "legacy": {
-                "type": "proportional_controller",
-                "Kp_pos": kp_pos,
-                "Kp_theta": kp_theta,
-                "goal_state": [4.0, 0.0, 0.0, 0.0],
-                "control_limits": control_limits.tolist(),
-            },
-            "evolved": {
-                "type": (
-                    "robust_cbf_qp_controller"
-                    if cbf_controller_kind == "robust"
-                    else "vanilla_cbf_qp_controller"
-                ),
-                "cbf_controller_kind": cbf_controller_kind,
-                "Kp_pos": kp_pos,
-                "Kp_theta": kp_theta,
-                "cbf_alpha_linear_class_k": cbf_alpha,
-                "cbf_velocity_weight": CBF_VELOCITY_WEIGHT,
-                "disturbance_norm_bound": disturbance_norm_bound,
-                "disturbance_norm": disturbance_norm,
-                "barrier": (
-                    "h_cbf(x,t)=||p-p_obs(t)||^2-r^2 + k_v*v*<p-p_obs(t),[cos(theta),sin(theta)]>; "
-                    "safety label uses h_safe=||p-p_obs(t)||^2-r^2"
-                ),
-                "control_limits": control_limits.tolist(),
-            },
-        },
-        "simulation": {
-            "time_step_s": dt,
-            "total_duration_s": total_time,
-            "num_steps": int(total_time / dt),
-        },
-        "seeds": {
-            "sampling_seed": sampling_seed,
-            "legacy_base_seed": legacy_seed,
-            "evolved_base_seed": evolved_seed,
-        },
-        "dataset_sizes": {
-            "D_legacy": len(d_legacy),
-            "D_evolved": len(d_evolved),
-            "D_paired_comparison": len(d_evolved_all) if paired_index_datasets else 0,
-        },
-        "label_counts": {
-            "D_legacy": summarize_labels(d_legacy),
-            "D_evolved_before_filter": summarize_labels(d_evolved_all),
-            "D_evolved_after_filter": summarize_labels(d_evolved),
-            "D_paired_legacy": summarize_labels(d_legacy) if paired_index_datasets else {},
-            "D_paired_evolved": summarize_labels(d_evolved_all) if paired_index_datasets else {},
-        },
-        "index_alignment": {
-            "case_id_column": True,
-            "paired_index_datasets_enabled": paired_index_datasets,
-            "paired_note": (
-                "Use D_paired_comparison.csv for one-to-one test cases with both controller labels."
-                if paired_index_datasets
-                else "Enable --paired-index-datasets to export one-to-one comparison rows."
-            ),
-        },
-    }
-
-    with (sys_dir / "metadata.json").open("w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=2)
+    metadata = write_metadata_snapshot(
+        generation_status="complete",
+        d_legacy_rows=d_legacy,
+        d_evolved_all_rows=d_evolved_all,
+        d_evolved_rows=d_evolved,
+    )
 
     print(
         f"Completed {system.name}: D_legacy={len(d_legacy)}, "
@@ -1094,6 +1294,14 @@ def main() -> None:
     total_start = time.perf_counter()
     parser = argparse.ArgumentParser()
     parser.add_argument("--n-samples", type=int, default=200)
+    parser.add_argument(
+        "--safe-runtime",
+        action="store_true",
+        help=(
+            "Relaunch with conservative CPU settings (single-threaded BLAS/XLA, CPU-only JAX, "
+            "JIT disabled) to reduce intermittent native runtime crashes."
+        ),
+    )
     parser.add_argument(
         "--out-dir",
         type=str,

@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -26,11 +27,16 @@ from jax import Array, random
 from matplotlib import patches
 from matplotlib.animation import FuncAnimation, PillowWriter
 
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import cbfkit.simulation.simulator as sim
 import cbfkit.systems.unicycle.models.accel_unicycle as unicycle
 from cbfkit.estimators import naive as estimator
 from cbfkit.integration import forward_euler as integrator
 from cbfkit.sensors import perfect as sensor
+from cbfkit.utils import logger as sim_logger
 from examples.unicycle.start_to_goal.generate_operational_rule_datasets import (
     DYNAMIC_SYSTEM,
     STATIC_SYSTEM,
@@ -113,6 +119,7 @@ def simulate_trace(
     else:
         raise ValueError(f"Unsupported controller kind: {controller_kind}")
 
+    sim_logger.clear_log()
     states, _u, _z, _p, _dkeys, _dvalues = sim.execute(
         x0=x0,
         dt=dt,
@@ -125,6 +132,7 @@ def simulate_trace(
         key=random.PRNGKey(seed),
         verbose=False,
     )
+    sim_logger.clear_log()
 
     traj = np.vstack([np.asarray(x0), np.asarray(states)])
     ts = np.arange(traj.shape[0]) * dt
@@ -308,6 +316,16 @@ def main() -> None:
     args = parser.parse_args()
 
     dataset_root = Path(args.dataset_root)
+    # Accept either:
+    # 1) a batch root containing <system>/metadata.json, or
+    # 2) the system directory itself containing metadata.json.
+    if (dataset_root / "metadata.json").exists():
+        if dataset_root.name != args.system:
+            raise ValueError(
+                f"--dataset-root points to a system directory ({dataset_root}), "
+                f"but its name does not match --system={args.system}."
+            )
+        dataset_root = dataset_root.parent
     out_dir = (
         Path(args.out_dir)
         if args.out_dir is not None

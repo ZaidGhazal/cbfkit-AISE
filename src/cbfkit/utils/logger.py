@@ -47,6 +47,11 @@ def log(new_data: Dict[str, Any]) -> None:
     LOG.append(new_data)
 
 
+def clear_log() -> None:
+    """Clears the in-memory simulation log buffer."""
+    LOG.clear()
+
+
 def write_log(filepath: str) -> None:
     """Writes logged data out to csv file specified at filepath.
 
