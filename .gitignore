@@ -13,7 +13,8 @@ __pycache__/
 # Video/image files
 *.gif
 *.png
-
+Collected Data - Batches/*
+examples/unicycle/start_to_goal/results/*
 # ROS Build/Make folders
 build/
 devel/

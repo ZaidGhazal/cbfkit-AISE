@@ -17,6 +17,7 @@ conda activate cbfkit
 N_BATCHES=100
 SAMPLES_PER_BATCH=50
 BASE_OUT_DIR="examples/unicycle/start_to_goal/results/vanilla"
+SEED_STRIDE=100000
 
 cleanup_memory() {
   # The Python process exit frees user-space memory. This adds a best-effort OS cache drop.
@@ -33,6 +34,8 @@ for batch_idx in $(seq 1 "${N_BATCHES}"); do
   python -u examples/unicycle/start_to_goal/generate_operational_rule_datasets.py \
     --safe-runtime \
     --n-samples "${SAMPLES_PER_BATCH}" \
+    --batch-index "${batch_idx}" \
+    --batch-seed-stride "${SEED_STRIDE}" \
     --paired-index-datasets \
     --failure-focused \
     --failure-target either \

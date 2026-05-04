@@ -1024,6 +1024,9 @@ def generate_for_system(
     cbf_controller_kind: str,
     disturbance_norm_bound: float,
     disturbance_norm: str,
+    seed_offset: int = 0,
+    batch_index: Optional[int] = None,
+    batch_seed_stride: int = 0,
 ) -> Dict[str, object]:
     system_start = time.perf_counter()
     print(
@@ -1156,6 +1159,9 @@ def generate_for_system(
                 "sampling_seed": sampling_seed,
                 "legacy_base_seed": legacy_seed,
                 "evolved_base_seed": evolved_seed,
+                "seed_offset": seed_offset,
+                "batch_index": batch_index,
+                "batch_seed_stride": batch_seed_stride,
             },
             "dataset_sizes": {
                 "D_legacy": len(legacy_rows),
@@ -1312,6 +1318,30 @@ def main() -> None:
     parser.add_argument("--sampling-seed", type=int, default=20260212)
     parser.add_argument("--legacy-seed", type=int, default=30100)
     parser.add_argument("--evolved-seed", type=int, default=40100)
+    parser.add_argument(
+        "--seed-offset",
+        type=int,
+        default=0,
+        help=(
+            "Offset added to sampling, legacy, and evolved seeds. Use this when running "
+            "multiple independent dataset batches."
+        ),
+    )
+    parser.add_argument(
+        "--batch-index",
+        type=int,
+        default=None,
+        help=(
+            "Optional batch index used to derive a seed offset. Effective offset is "
+            "--seed-offset + --batch-index * --batch-seed-stride."
+        ),
+    )
+    parser.add_argument(
+        "--batch-seed-stride",
+        type=int,
+        default=100000,
+        help="Seed stride used with --batch-index to keep batch sampling streams distinct.",
+    )
     parser.add_argument("--kp-pos", type=float, default=1.2)
     parser.add_argument("--kp-theta", type=float, default=1.0)
     parser.add_argument("--cbf-alpha", type=float, default=2.0)
@@ -1396,9 +1426,32 @@ def main() -> None:
         raise ValueError("--random-sample-percentage must be in [0, 100]")
     if args.cbf_controller == "robust" and args.disturbance_norm_bound <= 0.0:
         raise ValueError("--disturbance-norm-bound must be > 0 when --cbf-controller robust")
+    if args.batch_seed_stride <= 0:
+        raise ValueError("--batch-seed-stride must be > 0")
+    if args.batch_index is not None and args.batch_index < 0:
+        raise ValueError("--batch-index must be >= 0")
 
     out_root = Path(args.out_dir)
     control_limits = jnp.array([args.a_limit, args.omega_limit])
+    batch_seed_offset = 0
+    if args.batch_index is not None:
+        batch_seed_offset = args.batch_index * args.batch_seed_stride
+    effective_seed_offset = args.seed_offset + batch_seed_offset
+    effective_sampling_seed = args.sampling_seed + effective_seed_offset
+    effective_legacy_seed = args.legacy_seed + effective_seed_offset
+    effective_evolved_seed = args.evolved_seed + effective_seed_offset
+    if min(effective_sampling_seed, effective_legacy_seed, effective_evolved_seed) < 0:
+        raise ValueError(
+            "Effective seeds must be >= 0. Adjust --seed-offset, --batch-index, or base seeds."
+        )
+
+    print(
+        "Seed configuration: "
+        f"base_sampling={args.sampling_seed}, base_legacy={args.legacy_seed}, "
+        f"base_evolved={args.evolved_seed}, seed_offset={args.seed_offset}, "
+        f"batch_index={args.batch_index}, batch_seed_stride={args.batch_seed_stride}, "
+        f"effective_offset={effective_seed_offset}"
+    )
 
     summaries = {}
     for i, system in enumerate([DYNAMIC_SYSTEM, STATIC_SYSTEM]):  ## STATIC_SYSTEM,
@@ -1406,9 +1459,9 @@ def main() -> None:
             system=system,
             out_root=out_root,
             n_samples=args.n_samples,
-            sampling_seed=args.sampling_seed + 1000 * i,
-            legacy_seed=args.legacy_seed + 1000 * i,
-            evolved_seed=args.evolved_seed + 1000 * i,
+            sampling_seed=effective_sampling_seed + 1000 * i,
+            legacy_seed=effective_legacy_seed + 1000 * i,
+            evolved_seed=effective_evolved_seed + 1000 * i,
             dt=args.dt,
             total_time=args.tf,
             kp_pos=args.kp_pos,
@@ -1425,6 +1478,9 @@ def main() -> None:
             cbf_controller_kind=args.cbf_controller,
             disturbance_norm_bound=args.disturbance_norm_bound,
             disturbance_norm=args.disturbance_norm,
+            seed_offset=effective_seed_offset,
+            batch_index=args.batch_index,
+            batch_seed_stride=args.batch_seed_stride,
         )
 
     summary_path = out_root / "summary.json"
