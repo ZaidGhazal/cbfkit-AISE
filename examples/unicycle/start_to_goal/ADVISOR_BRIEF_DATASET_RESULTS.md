@@ -342,6 +342,7 @@ Extension strategy:
 Each run stores:
 
 - Random seeds (sampling and controller runs)
+- Batch seed context (`batch_index`, `batch_seed_stride`, and effective `seed_offset`) when used for multi-batch generation
 - Controller parameters and selected CBF variant
 - Simulation horizon and step size
 - Dataset-size and label-count summaries

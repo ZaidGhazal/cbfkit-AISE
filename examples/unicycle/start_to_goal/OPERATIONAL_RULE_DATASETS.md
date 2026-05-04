@@ -52,6 +52,9 @@ Otherwise the outcome is `Fail`.
 
 Random seeds are saved in each system's `metadata.json`.
 
+When generating multiple batch folders, pass a distinct batch index or seed offset.
+Otherwise each batch reuses the same sampled operational cases.
+
 ## Generate datasets
 
 From repo root:
@@ -63,6 +66,13 @@ python3 examples/unicycle/start_to_goal/generate_operational_rule_datasets.py --
 python3 examples/unicycle/start_to_goal/generate_operational_rule_datasets.py \
   --n-samples 200 \
   --paired-index-datasets
+
+# Independent batch run; records the effective offset in metadata.json
+python3 examples/unicycle/start_to_goal/generate_operational_rule_datasets.py \
+  --n-samples 50 \
+  --paired-index-datasets \
+  --batch-index 7 \
+  --out-dir examples/unicycle/start_to_goal/results/vanilla/batch7/samples_50
 ```
 
 Outputs are written to:
